@@ -1,0 +1,206 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Medallion-Flavored Bot</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
+<style>
+  :root {
+    --bg: #0b0e14; --card: #131722; --border: #232838; --text: #e6e8ee;
+    --muted: #8a92a6; --primary: #22c55e; --danger: #ef4444; --warn: #f59e0b;
+  }
+  * { box-sizing: border-box; }
+  body { background: var(--bg); color: var(--text); font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; margin: 0; padding: 24px; }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  .sub { color: var(--muted); font-size: 13px; margin-bottom: 20px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px; margin-bottom: 20px; }
+  .card { background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 16px; }
+  .card .label { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .04em; }
+  .card .value { font-size: 24px; font-weight: 600; margin-top: 6px; }
+  .value.pos { color: var(--primary); } .value.neg { color: var(--danger); }
+  .badge { display: inline-block; padding: 2px 8px; border-radius: 6px; font-size: 11px; font-weight: 700; letter-spacing: .03em; }
+  .badge.paper { background: #1e3a8a33; color: #60a5fa; }
+  .badge.live { background: #7f1d1d33; color: #f87171; }
+  .badge.halted { background: #7f1d1d33; color: #f87171; margin-left: 8px; }
+  .badge.ok { background: #14532d33; color: #4ade80; }
+  section { background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 16px; margin-bottom: 20px; }
+  section h2 { font-size: 14px; margin: 0 0 12px; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: 8px 6px; border-bottom: 1px solid var(--border); }
+  th { color: var(--muted); font-weight: 500; }
+  .pnl-pos { color: var(--primary); } .pnl-neg { color: var(--danger); }
+  .strategy-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px,1fr)); gap: 12px; }
+  .strat-card { background: #0f1420; border: 1px solid var(--border); border-radius: 8px; padding: 12px; }
+  .strat-card .name { font-weight: 600; margin-bottom: 6px; display:flex; justify-content: space-between; align-items:center;}
+  .event { padding: 6px 0; border-bottom: 1px solid var(--border); font-size: 12.5px; color: #c7cbdb; }
+  .event time { color: var(--muted); margin-right: 8px; }
+  canvas { max-height: 260px; }
+  .footer-note { color: var(--muted); font-size: 12px; margin-top: 20px; line-height: 1.5; }
+  .empty { color: var(--muted); font-size: 13px; padding: 8px 0; }
+</style>
+</head>
+<body>
+  <h1>Medallion-Flavored Trading Bot <span id="mode-badge" class="badge paper">PAPER</span><span id="halt-badge"></span></h1>
+  <div class="sub">Mean-reversion core + momentum overlay + market-neutral pairs, risk-capped. Education / research tool -- not financial advice.</div>
+
+  <div class="grid">
+    <div class="card"><div class="label">Equity</div><div class="value" id="equity">--</div></div>
+    <div class="card"><div class="label">Total Return</div><div class="value" id="return">--</div></div>
+    <div class="card"><div class="label">Cash (USDT)</div><div class="value" id="cash">--</div></div>
+    <div class="card"><div class="label">Today's P&L</div><div class="value" id="daily-pnl">--</div></div>
+    <div class="card"><div class="label">Open Positions</div><div class="value" id="open-count">--</div></div>
+    <div class="card"><div class="label">Last Cycle (UTC)</div><div class="value" id="last-cycle" style="font-size:14px;">--</div></div>
+  </div>
+
+  <section>
+    <h2>Equity Curve</h2>
+    <canvas id="equityChart"></canvas>
+  </section>
+
+  <section>
+    <h2>Strategy Performance (Secret 4: kill dead styles automatically)</h2>
+    <div class="strategy-grid" id="strategy-grid"></div>
+  </section>
+
+  <section>
+    <h2>Open Positions &amp; Pairs</h2>
+    <table id="open-table"><thead><tr><th>Type</th><th>Symbol / Pair</th><th>Strategy</th><th>Entry</th><th>Stop</th><th>Opened</th></tr></thead><tbody></tbody></table>
+    <div class="empty" id="open-empty" style="display:none;">No open positions right now -- waiting for a stretched rubber band or a building wave.</div>
+  </section>
+
+  <section>
+    <h2>Recent Closed Trades</h2>
+    <table id="trades-table"><thead><tr><th>Symbol/Pair</th><th>Strategy</th><th>Exit</th><th>PnL</th><th>Reason</th></tr></thead><tbody></tbody></table>
+    <div class="empty" id="trades-empty" style="display:none;">No trades closed yet.</div>
+  </section>
+
+  <section>
+    <h2>Decision Log (every entry/exit explained in one sentence)</h2>
+    <div id="events"></div>
+    <div class="empty" id="events-empty" style="display:none;">No events yet -- the bot runs its first cycle shortly after boot.</div>
+  </section>
+
+  <div class="footer-note">
+    Universe: <span id="universe"></span><br>
+    Pairs: <span id="pairs-universe"></span><br>
+    Rules: 1% risk per trade &middot; no leverage &middot; max 15% notional per trade &middot; daily loss brake at -4% &middot; auto kill-switch below 35% win-rate over last 20 trades.<br>
+    This dashboard is for education/research only and is not financial advice. Past performance (including Medallion's) does not guarantee future results.
+  </div>
+
+<script>
+let chart;
+async function refresh() {
+  try {
+    const res = await fetch('/api/status');
+    const s = await res.json();
+
+    document.getElementById('mode-badge').textContent = s.mode + (s.live_trading ? '' : '');
+    document.getElementById('mode-badge').className = 'badge ' + (s.mode === 'LIVE' ? 'live' : 'paper');
+    document.getElementById('halt-badge').innerHTML = s.halted_today ? '<span class="badge halted">DAILY LOSS BRAKE ACTIVE</span>' : '';
+
+    document.getElementById('equity').textContent = '$' + s.equity.toLocaleString(undefined, {maximumFractionDigits:2});
+    const ret = ((s.equity - s.starting_equity) / s.starting_equity) * 100;
+    const retEl = document.getElementById('return');
+    retEl.textContent = (ret >= 0 ? '+' : '') + ret.toFixed(2) + '%';
+    retEl.className = 'value ' + (ret >= 0 ? 'pos' : 'neg');
+
+    document.getElementById('cash').textContent = '$' + s.cash_usdt.toLocaleString(undefined, {maximumFractionDigits:2});
+
+    const dailyPnl = s.equity - s.day_start_equity;
+    const dailyEl = document.getElementById('daily-pnl');
+    dailyEl.textContent = (dailyPnl >= 0 ? '+$' : '-$') + Math.abs(dailyPnl).toFixed(2);
+    dailyEl.className = 'value ' + (dailyPnl >= 0 ? 'pos' : 'neg');
+
+    document.getElementById('open-count').textContent = (s.open_positions.length + s.open_pairs.length);
+    document.getElementById('last-cycle').textContent = s.last_cycle ? new Date(s.last_cycle).toLocaleString() : '--';
+
+    document.getElementById('universe').textContent = s.universe.join(', ');
+    document.getElementById('pairs-universe').textContent = s.pairs_universe.join(', ');
+
+    // strategy cards
+    const grid = document.getElementById('strategy-grid');
+    grid.innerHTML = '';
+    for (const [name, st] of Object.entries(s.strategy_stats)) {
+      const div = document.createElement('div');
+      div.className = 'strat-card';
+      const statusBadge = st.enabled ? '<span class="badge ok">ACTIVE</span>' : '<span class="badge halted">KILLED</span>';
+      div.innerHTML = `
+        <div class="name"><span>${name.replace('_',' ')}</span>${statusBadge}</div>
+        <div style="color:var(--muted); font-size:12px;">Trades: ${st.trades} &middot; Win rate: ${st.win_rate !== null ? (st.win_rate*100).toFixed(0)+'%' : 'n/a'}</div>
+        <div style="font-size:13px; margin-top:4px;">Total PnL: <span class="${st.total_pnl>=0?'pnl-pos':'pnl-neg'}">$${st.total_pnl.toFixed(2)}</span></div>
+      `;
+      grid.appendChild(div);
+    }
+
+    // open positions/pairs table
+    const openBody = document.querySelector('#open-table tbody');
+    openBody.innerHTML = '';
+    let anyOpen = false;
+    for (const p of s.open_positions) {
+      anyOpen = true;
+      const tr = document.createElement('tr');
+      tr.innerHTML = `<td>Single</td><td>${p.symbol}</td><td>${p.strategy}</td><td>$${p.entry.toFixed(4)}</td><td>$${p.stop.toFixed(4)}</td><td>${new Date(p.opened_at).toLocaleString()}</td>`;
+      openBody.appendChild(tr);
+    }
+    for (const pr of s.open_pairs) {
+      anyOpen = true;
+      const tr = document.createElement('tr');
+      tr.innerHTML = `<td>Pair</td><td>${pr.pair}</td><td>pairs (long ${pr.long_symbol} / short ${pr.short_symbol})</td><td>--</td><td>--</td><td>${new Date(pr.opened_at).toLocaleString()}</td>`;
+      openBody.appendChild(tr);
+    }
+    document.getElementById('open-empty').style.display = anyOpen ? 'none' : 'block';
+
+    // closed trades table
+    const tradesBody = document.querySelector('#trades-table tbody');
+    tradesBody.innerHTML = '';
+    for (const t of s.closed_trades) {
+      const tr = document.createElement('tr');
+      const label = t.symbol || t.pair;
+      tr.innerHTML = `<td>${label}</td><td>${t.strategy}</td><td>${t.exit_kind}</td><td class="${t.pnl>=0?'pnl-pos':'pnl-neg'}">$${t.pnl.toFixed(2)}</td><td>${t.exit_reason || ''}</td>`;
+      tradesBody.appendChild(tr);
+    }
+    document.getElementById('trades-empty').style.display = s.closed_trades.length ? 'none' : 'block';
+
+    // events
+    const eventsDiv = document.getElementById('events');
+    eventsDiv.innerHTML = '';
+    for (const e of s.events) {
+      const div = document.createElement('div');
+      div.className = 'event';
+      div.innerHTML = `<time>${new Date(e.time).toLocaleString()}</time>${e.message}`;
+      eventsDiv.appendChild(div);
+    }
+    document.getElementById('events-empty').style.display = s.events.length ? 'none' : 'block';
+
+    // equity chart
+    const labels = s.equity_history.map(p => new Date(p.time).toLocaleString());
+    const data = s.equity_history.map(p => p.equity);
+    if (!chart) {
+      const ctx = document.getElementById('equityChart').getContext('2d');
+      chart = new Chart(ctx, {
+        type: 'line',
+        data: { labels, datasets: [{ label: 'Equity (USDT)', data, borderColor: '#22c55e', backgroundColor: 'rgba(34,197,94,0.08)', fill: true, pointRadius: 0, tension: 0.15 }] },
+        options: {
+          responsive: true,
+          scales: {
+            x: { ticks: { color: '#8a92a6', maxTicksLimit: 8 }, grid: { color: '#232838' } },
+            y: { ticks: { color: '#8a92a6' }, grid: { color: '#232838' } },
+          },
+          plugins: { legend: { labels: { color: '#e6e8ee' } } },
+        }
+      });
+    } else {
+      chart.data.labels = labels;
+      chart.data.datasets[0].data = data;
+      chart.update();
+    }
+  } catch (err) {
+    console.error('refresh failed', err);
+  }
+}
+refresh();
+setInterval(refresh, 30000);
+</script>
+</body>
+</html>
