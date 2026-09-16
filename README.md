@@ -72,7 +72,7 @@ JSON status: http://localhost:5000/api/status
    Singapore, not US, if you ever flip live mode on. Paper mode works
    anywhere since it only reads public market data.
 4. Build command: `pip install -r requirements.txt`
-   Start command: `gunicorn --workers 1 --threads 4 --bind 0.0.0.0:$PORT app:app`
+   Start command: `gunicorn --workers 1 --threads 4 --timeout 60 --bind 0.0.0.0:$PORT app:app`
    (Keep `--workers 1` — the bot's background loop and state file aren't
    safe to run in more than one process.)
 5. Optional env vars: `STARTING_EQUITY_USDT` (default 10000).
@@ -127,3 +127,22 @@ data/state.json          Persisted paper-trading state (created on first run)
   still lose money together for a while before reconverging. The pair
   stop-out (z > 3.5) exists exactly for that.
 - No leverage is used anywhere in this bot, by design.
+
+
+## SINGLE-FILE EDITION (use this one)
+
+This zip is the **single-file edition**: the entire bot lives in one
+`app.py` (plus `requirements.txt`). No subfolders -- nothing can get lost
+when uploading to GitHub via the web UI.
+
+Repo layout (both files at repo root):
+```
+app.py             <- the entire bot + dashboard
+requirements.txt
+```
+
+Render settings:
+- Build command: `pip install -r requirements.txt`
+- Start command: `gunicorn --workers 1 --threads 4 --timeout 60 --bind 0.0.0.0:$PORT app:app`
+- Optional env var: `PYTHON_VERSION=3.11.16` (Render's default 3.14 also works,
+  it just compiles pandas from source which is slower)

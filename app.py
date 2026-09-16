@@ -10,12 +10,18 @@ Strategy: mean-reversion core (RSI(2) dips in uptrends) + momentum overlay
 -4% daily loss brake, and an auto kill-switch that disables a strategy
 for 48h if its last-20-trades win rate drops below 35%.
 
+IMPORTANT: the background trading cycle does slow network I/O (Binance
+klines, possibly slow/blocked depending on server region). That work
+NEVER happens while holding the lock a web request needs -- otherwise a
+slow/blocked cycle stalls every dashboard request behind it and can take
+the whole app down. See _cycle_loop() / api_status() below.
+
 PAPER trading mode by default. Education/research tool -- not financial
 advice.
 
 Run:   pip install -r requirements.txt
        python app.py
-  or:  gunicorn --workers 1 --threads 4 --bind 0.0.0.0:$PORT app:app
+  or:  gunicorn --workers 1 --threads 4 --timeout 60 --bind 0.0.0.0:$PORT app:app
 """
 
 import json
@@ -115,10 +121,9 @@ MAX_POSITION_USDT = float(os.environ.get("MAX_POSITION_USDT", "50"))
 STATE_FILE = os.environ.get("STATE_FILE", os.path.join(os.path.dirname(__file__), "..", "data", "state.json"))
 BINANCE_BASE_URLS = [
     "https://api.binance.com",
-    "https://api1.binance.com",
-    "https://api2.binance.com",
     "https://api.binance.us",   # fallback for geo-blocked regions (subset of symbols)
 ]
+BINANCE_TIMEOUT_SECONDS = 5   # fail fast -- a blocked region should not stall a whole cycle
 
 
 # ============================ INDICATORS ============================
@@ -153,8 +158,13 @@ def rate_of_change(series: pd.Series, period: int) -> pd.Series:
 
 
 # =========================== DATA FEED =============================
-"""Market data fetching. Public klines only -- no auth, no geo-block issues
-for reading data (only signed order endpoints get region-blocked)."""
+"""Market data fetching. Public klines only -- no auth needed to read data.
+
+Note: some regions (notably US-hosted servers) have historically had
+Binance block even public market-data endpoints, not just signed trading
+endpoints. We fail fast (short timeout, few fallbacks) so a blocked region
+degrades gracefully instead of stalling a whole trading cycle.
+"""
 
 
 
@@ -173,7 +183,7 @@ def _fetch_klines(symbol: str, interval: str, limit: int):
             r = _session.get(
                 f"{base}/api/v3/klines",
                 params={"symbol": symbol, "interval": interval, "limit": limit},
-                timeout=10,
+                timeout=BINANCE_TIMEOUT_SECONDS,
             )
             r.raise_for_status()
             return r.json()
@@ -676,11 +686,16 @@ def run_cycle(state: dict) -> dict:
         return p if p is not None else None
 
     live_prices = {}
+    fetch_attempts = {"ok": 0, "fail": 0}
 
     def cached_price(sym):
         if sym not in live_prices:
             p = safe_price(sym)
             live_prices[sym] = p
+            if p is None:
+                fetch_attempts["fail"] += 1
+            else:
+                fetch_attempts["ok"] += 1
         return live_prices[sym] if live_prices[sym] is not None else None
 
     def price_or_last(sym, fallback):
@@ -789,6 +804,23 @@ def run_cycle(state: dict) -> dict:
                         open_pair(state, sig, long_qty, short_qty)
                         state["events"].append({"time": now.isoformat(), "message": f"OPENED PAIR {pair_key}: {sig['reason']}"})
 
+    # surface a clear signal if the data feed is unreachable (e.g. region-blocked host)
+    if fetch_attempts["fail"] > 0 and fetch_attempts["ok"] == 0:
+        state["data_feed_status"] = "unreachable"
+        if not state.get("_feed_warned"):
+            state["events"].append({
+                "time": now.isoformat(),
+                "message": (
+                    "DATA FEED UNREACHABLE: could not fetch any Binance prices from this "
+                    "server (likely region-blocked). No new signals can be evaluated until "
+                    "this resolves -- try redeploying to a Frankfurt or Singapore region."
+                ),
+            })
+            state["_feed_warned"] = True
+    else:
+        state["data_feed_status"] = "ok"
+        state["_feed_warned"] = False
+
     state["events"] = state["events"][-200:]
     state["last_cycle"] = now.isoformat()
 
@@ -846,6 +878,7 @@ TEMPLATE_HTML = r"""<!DOCTYPE html>
 <body>
   <h1>Medallion-Flavored Trading Bot <span id="mode-badge" class="badge paper">PAPER</span><span id="halt-badge"></span></h1>
   <div class="sub">Mean-reversion core + momentum overlay + market-neutral pairs, risk-capped. Education / research tool -- not financial advice.</div>
+  <div id="feed-banner" style="display:none; background:#7f1d1d33; border:1px solid #7f1d1d; color:#f87171; border-radius:8px; padding:10px 14px; font-size:13px; margin-bottom:16px;"></div>
 
   <div class="grid">
     <div class="card"><div class="label">Equity</div><div class="value" id="equity">--</div></div>
@@ -901,6 +934,17 @@ async function refresh() {
     document.getElementById('mode-badge').textContent = s.mode + (s.live_trading ? '' : '');
     document.getElementById('mode-badge').className = 'badge ' + (s.mode === 'LIVE' ? 'live' : 'paper');
     document.getElementById('halt-badge').innerHTML = s.halted_today ? '<span class="badge halted">DAILY LOSS BRAKE ACTIVE</span>' : '';
+
+    const feedBanner = document.getElementById('feed-banner');
+    if (s.data_feed_status === 'unreachable') {
+      feedBanner.style.display = 'block';
+      feedBanner.textContent = 'Cannot reach Binance from this server -- likely region-blocked. No new signals can be evaluated until this resolves. Try redeploying to a Frankfurt or Singapore region on Render.';
+    } else if (s.last_error) {
+      feedBanner.style.display = 'block';
+      feedBanner.textContent = 'Last cycle error: ' + s.last_error;
+    } else {
+      feedBanner.style.display = 'none';
+    }
 
     document.getElementById('equity').textContent = '$' + s.equity.toLocaleString(undefined, {maximumFractionDigits:2});
     const ret = ((s.equity - s.starting_equity) / s.starting_equity) * 100;
@@ -1017,17 +1061,23 @@ log = logging.getLogger("medallion_bot.app")
 app = Flask(__name__)
 HTML_TEMPLATE = TEMPLATE_HTML
 
-_state_lock = threading.Lock()
+_state_lock = threading.Lock()  # only ever held briefly -- never during network I/O
 _state = load_state()
 _last_error = None
+
+
+def _get_state_snapshot():
+    with _state_lock:
+        return _state
 
 
 def _cycle_loop():
     global _state, _last_error
     while True:
         try:
+            working_state = run_cycle(_state)
             with _state_lock:
-                _state = run_cycle(_state)
+                _state = working_state
                 save_state(_state)
                 _last_error = None
             log.info("Cycle complete. Open positions: %d, open pairs: %d",
@@ -1045,67 +1095,76 @@ def start_background_loop():
 
 @app.route("/")
 def dashboard():
-    return render_template_string(HTML_TEMPLATE, mode=_state.get("mode", "PAPER"))
+    s = _get_state_snapshot()
+    return render_template_string(HTML_TEMPLATE, mode=s.get("mode", "PAPER"))
 
 
 @app.route("/api/status")
 def api_status():
-    with _state_lock:
-        s = _state
-        equity = mark_to_market(s)
-        strat_stats = {}
-        for strat_name in ("mean_reversion", "momentum", "pairs"):
-            trades = [t for t in s["closed_trades"] if t["strategy"] == strat_name]
-            wins = [t for t in trades if t["pnl"] > 0]
-            losses = [t for t in trades if t["pnl"] <= 0]
-            avg_win = sum(t["pnl"] for t in wins) / len(wins) if wins else 0
-            avg_loss = sum(t["pnl"] for t in losses) / len(losses) if losses else 0
-            ks = s.get("kill_switch", {}).get(strat_name, {})
-            strat_stats[strat_name] = {
-                "trades": len(trades),
-                "win_rate": round(len(wins) / len(trades), 3) if trades else None,
-                "avg_win": round(avg_win, 2),
-                "avg_loss": round(avg_loss, 2),
-                "total_pnl": round(sum(t["pnl"] for t in trades), 2),
-                "enabled": kill_switch_is_enabled(s, strat_name),
-                "disabled_until": ks.get("disabled_until"),
-            }
-
-        payload = {
-            "mode": s.get("mode"),
-            "live_trading": LIVE_TRADING,
-            "equity": round(equity, 2),
-            "starting_equity": s.get("starting_equity"),
-            "cash_usdt": round(s.get("cash_usdt", 0), 2),
-            "day_start_equity": round(s.get("day_start_equity", 0), 2),
-            "halted_today": s.get("halted_today", False),
-            "open_positions": s.get("open_positions", []),
-            "open_pairs": s.get("open_pairs", []),
-            "closed_trades": list(reversed(s.get("closed_trades", [])))[:30],
-            "equity_history": s.get("equity_history", [])[-300:],
-            "events": list(reversed(s.get("events", [])))[:40],
-            "strategy_stats": strat_stats,
-            "last_cycle": s.get("last_cycle"),
-            "last_error": _last_error,
-            "server_time": datetime.now(timezone.utc).isoformat(),
-            "universe": MR_MOMENTUM_UNIVERSE,
-            "pairs_universe": [f"{a}/{b}" for a, b in PAIRS_UNIVERSE],
+    s = _get_state_snapshot()
+    equity = mark_to_market(s)
+    strat_stats = {}
+    for strat_name in ("mean_reversion", "momentum", "pairs"):
+        trades = [t for t in s["closed_trades"] if t["strategy"] == strat_name]
+        wins = [t for t in trades if t["pnl"] > 0]
+        losses = [t for t in trades if t["pnl"] <= 0]
+        avg_win = sum(t["pnl"] for t in wins) / len(wins) if wins else 0
+        avg_loss = sum(t["pnl"] for t in losses) / len(losses) if losses else 0
+        ks = s.get("kill_switch", {}).get(strat_name, {})
+        strat_stats[strat_name] = {
+            "trades": len(trades),
+            "win_rate": round(len(wins) / len(trades), 3) if trades else None,
+            "avg_win": round(avg_win, 2),
+            "avg_loss": round(avg_loss, 2),
+            "total_pnl": round(sum(t["pnl"] for t in trades), 2),
+            "enabled": kill_switch_is_enabled(s, strat_name),
+            "disabled_until": ks.get("disabled_until"),
         }
-        return jsonify(payload)
+
+    payload = {
+        "mode": s.get("mode"),
+        "live_trading": LIVE_TRADING,
+        "equity": round(equity, 2),
+        "starting_equity": s.get("starting_equity"),
+        "cash_usdt": round(s.get("cash_usdt", 0), 2),
+        "day_start_equity": round(s.get("day_start_equity", 0), 2),
+        "halted_today": s.get("halted_today", False),
+        "data_feed_status": s.get("data_feed_status", "unknown"),
+        "open_positions": s.get("open_positions", []),
+        "open_pairs": s.get("open_pairs", []),
+        "closed_trades": list(reversed(s.get("closed_trades", [])))[:30],
+        "equity_history": s.get("equity_history", [])[-300:],
+        "events": list(reversed(s.get("events", [])))[:40],
+        "strategy_stats": strat_stats,
+        "last_cycle": s.get("last_cycle"),
+        "last_error": _last_error,
+        "server_time": datetime.now(timezone.utc).isoformat(),
+        "universe": MR_MOMENTUM_UNIVERSE,
+        "pairs_universe": [f"{a}/{b}" for a, b in PAIRS_UNIVERSE],
+    }
+    return jsonify(payload)
 
 
 @app.route("/health")
 def health():
-    return jsonify({"status": "ok", "mode": _state.get("mode")})
+    s = _get_state_snapshot()
+    return jsonify({"status": "ok", "mode": s.get("mode")})
 
 
 @app.route("/api/run-now", methods=["POST"])
 def run_now():
-    """Manual trigger for one cycle -- still 100% rule-driven."""
-    global _state
-    with _state_lock:
-        _state = run_cycle(_state)
-        save_state(_state)
+    """Manual trigger for one cycle -- runs unlocked like the scheduler,
+    still 100% rule-driven."""
+    global _state, _last_error
+    try:
+        working_state = run_cycle(_state)
+        with _state_lock:
+            _state = working_state
+            save_state(_state)
+            _last_error = None
+    except Exception as e:  # noqa: BLE001
+        _last_error = str(e)
+        return jsonify({"ok": False, "error": str(e)}), 500
     return jsonify({"ok": True})
 
 
