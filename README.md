@@ -141,6 +141,16 @@ app.py             <- the entire bot + dashboard
 requirements.txt
 ```
 
+KEEP-ALIVE (required on Render free tier):
+The free tier sleeps the service after ~15 min without web traffic, and a
+sleeping bot cannot trade. Add the deployed URL's /health path to a free
+pinger (UptimeRobot, cron-job.org, etc.) at a 10-minute interval.
+
+Built-in watchdog: if the background trading loop ever dies (it can, on
+some PaaS runtimes), any web request -- including those keep-alive pings
+-- automatically triggers the missed cycle. The dashboard also reports
+`loop_alive` in /api/status.
+
 Render settings:
 - Build command: `pip install -r requirements.txt`
 - Start command: `gunicorn --workers 1 --threads 4 --timeout 60 --bind 0.0.0.0:$PORT app:app`

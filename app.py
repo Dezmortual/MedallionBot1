@@ -1061,7 +1061,10 @@ log = logging.getLogger("medallion_bot.app")
 app = Flask(__name__)
 HTML_TEMPLATE = TEMPLATE_HTML
 
-_state_lock = threading.Lock()  # only ever held briefly -- never during network I/O
+_state_lock = threading.Lock()        # brief holds only -- never during network I/O
+_cycle_running_lock = threading.Lock()  # only one cycle at a time (loop/watchdog/manual)
+_last_watchdog_kick = 0.0
+
 _state = load_state()
 _last_error = None
 
@@ -1071,26 +1074,88 @@ def _get_state_snapshot():
         return _state
 
 
-def _cycle_loop():
+def _run_one_cycle():
+    """Runs a single trading cycle. Caller must hold _cycle_running_lock."""
     global _state, _last_error
+    working_state = run_cycle(_state)
+    with _state_lock:
+        _state = working_state
+        save_state(_state)
+        _last_error = None
+    log.info("Cycle complete. Open positions: %d, open pairs: %d",
+             len(_state["open_positions"]), len(_state["open_pairs"]))
+
+
+def _cycle_loop():
     while True:
-        try:
-            working_state = run_cycle(_state)
-            with _state_lock:
-                _state = working_state
-                save_state(_state)
-                _last_error = None
-            log.info("Cycle complete. Open positions: %d, open pairs: %d",
-                     len(_state["open_positions"]), len(_state["open_pairs"]))
-        except Exception as e:  # noqa: BLE001
-            _last_error = str(e)
-            log.exception("Cycle failed: %s", e)
+        if _cycle_running_lock.acquire(blocking=False):
+            try:
+                _run_one_cycle()
+            except Exception as e:  # noqa: BLE001
+                global _last_error
+                _last_error = str(e)
+                log.exception("Cycle failed: %s", e)
+            finally:
+                _cycle_running_lock.release()
+        else:
+            log.info("Skipping cycle -- another cycle is already running")
         time.sleep(CYCLE_SECONDS)
 
 
 def start_background_loop():
-    t = threading.Thread(target=_cycle_loop, daemon=True)
+    t = threading.Thread(target=_cycle_loop, daemon=True, name="trading_loop")
     t.start()
+
+
+def _loop_alive():
+    return any(t.name == "trading_loop" and t.is_alive() for t in threading.enumerate())
+
+
+def _cycle_is_stale():
+    s = _get_state_snapshot()
+    lc = s.get("last_cycle")
+    if not lc:
+        return True
+    try:
+        age = (datetime.now(timezone.utc) - datetime.fromisoformat(lc)).total_seconds()
+    except Exception:  # noqa: BLE001
+        return False
+    return age > CYCLE_SECONDS + 300  # cycle interval + 5 min grace
+
+
+def _watchdog_kick():
+    """Fire-and-forget: if no cycle has completed recently, start one in a
+    fresh thread. Keeps the bot trading even when the background loop is
+    dead (observed on some PaaS runtimes)."""
+    global _last_watchdog_kick, _last_error
+    now = time.time()
+    if not _cycle_is_stale():
+        return
+    if now - _last_watchdog_kick < 600:  # at most one watchdog kick per 10 min
+        return
+    if not _cycle_running_lock.acquire(blocking=False):
+        return  # a cycle is running right now (loop or manual) -- fine
+    _last_watchdog_kick = now
+    log.warning("Watchdog: no recent cycle (loop_alive=%s) -- kicking one now", _loop_alive())
+
+    def _run():
+        try:
+            _run_one_cycle()
+        except Exception as e:  # noqa: BLE001
+            _last_error = str(e)
+            log.exception("Watchdog cycle failed: %s", e)
+        finally:
+            _cycle_running_lock.release()
+
+    threading.Thread(target=_run, daemon=True, name="watchdog_cycle").start()
+
+
+@app.before_request
+def _watchdog():
+    try:
+        _watchdog_kick()
+    except Exception:  # noqa: BLE001
+        pass
 
 
 @app.route("/")
@@ -1130,6 +1195,7 @@ def api_status():
         "day_start_equity": round(s.get("day_start_equity", 0), 2),
         "halted_today": s.get("halted_today", False),
         "data_feed_status": s.get("data_feed_status", "unknown"),
+        "loop_alive": _loop_alive(),
         "open_positions": s.get("open_positions", []),
         "open_pairs": s.get("open_pairs", []),
         "closed_trades": list(reversed(s.get("closed_trades", [])))[:30],
@@ -1153,18 +1219,17 @@ def health():
 
 @app.route("/api/run-now", methods=["POST"])
 def run_now():
-    """Manual trigger for one cycle -- runs unlocked like the scheduler,
-    still 100% rule-driven."""
-    global _state, _last_error
+    """Manual trigger for a single cycle -- same rules as the automatic ones."""
+    if not _cycle_running_lock.acquire(blocking=False):
+        return jsonify({"ok": False, "error": "A cycle is already running -- try again in a moment"}), 429
     try:
-        working_state = run_cycle(_state)
-        with _state_lock:
-            _state = working_state
-            save_state(_state)
-            _last_error = None
+        _run_one_cycle()
     except Exception as e:  # noqa: BLE001
+        global _last_error
         _last_error = str(e)
         return jsonify({"ok": False, "error": str(e)}), 500
+    finally:
+        _cycle_running_lock.release()
     return jsonify({"ok": True})
 
 
