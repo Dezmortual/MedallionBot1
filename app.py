@@ -24,6 +24,7 @@ Run:   pip install -r requirements.txt
   or:  gunicorn --workers 1 --threads 4 --timeout 60 --bind 0.0.0.0:$PORT app:app
 """
 
+import copy
 import json
 import logging
 import os
@@ -124,6 +125,9 @@ BINANCE_BASE_URLS = [
     "https://api.binance.us",   # fallback for geo-blocked regions (subset of symbols)
 ]
 BINANCE_TIMEOUT_SECONDS = 5   # fail fast -- a blocked region should not stall a whole cycle
+FETCH_DEADLINE_SECONDS = 20    # HARD wall-clock bound per klines fetch, incl. DNS
+                               # (requests' timeout does NOT cover DNS resolution,
+                               # which is what hung the boot cycle on Render)
 
 
 # ============================ INDICATORS ============================
@@ -168,12 +172,16 @@ degrades gracefully instead of stalling a whole trading cycle.
 
 
 
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 
 
 
 _session = requests.Session()
 _cache = {}
 _CACHE_TTL = 60  # seconds -- avoid hammering the API across strategies in one cycle
+
+
+_fetch_pool = ThreadPoolExecutor(max_workers=4)
 
 
 def _fetch_klines(symbol: str, interval: str, limit: int):
@@ -193,6 +201,20 @@ def _fetch_klines(symbol: str, interval: str, limit: int):
     raise RuntimeError(f"All Binance endpoints failed for {symbol}: {last_err}")
 
 
+def _fetch_klines_bounded(symbol: str, interval: str, limit: int) -> list:
+    """Fetch with a HARD wall-clock deadline. requests' timeout covers connect
+    and read but NOT DNS resolution -- a hung getaddrinfo at container boot
+    (observed on Render) stalled the first cycle forever. Submitting to a
+    pool and bounding the wait covers everything; a truly hung fetch thread
+    is abandoned, not waited on."""
+    fut = _fetch_pool.submit(_fetch_klines, symbol, interval, limit)
+    try:
+        return fut.result(timeout=FETCH_DEADLINE_SECONDS)
+    except FutureTimeout:
+        raise RuntimeError(
+            f"klines fetch for {symbol} exceeded {FETCH_DEADLINE_SECONDS}s -- abandoned")
+
+
 def get_klines(symbol: str, interval: str = None, limit: int = None) -> pd.DataFrame:
     interval = interval or TIMEFRAME
     limit = limit or CANDLE_LOOKBACK
@@ -201,7 +223,7 @@ def get_klines(symbol: str, interval: str = None, limit: int = None) -> pd.DataF
     if key in _cache and now - _cache[key][0] < _CACHE_TTL:
         return _cache[key][1].copy()
 
-    raw = _fetch_klines(symbol, interval, limit)
+    raw = _fetch_klines_bounded(symbol, interval, limit)
     df = pd.DataFrame(raw, columns=[
         "open_time", "open", "high", "low", "close", "volume", "close_time",
         "quote_asset_volume", "trades", "taker_buy_base", "taker_buy_quote", "ignore",
@@ -1053,7 +1075,6 @@ setInterval(refresh, 30000);
 </html>
 """
 
-
 # ============================ FLASK APP ==============================
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("medallion_bot.app")
@@ -1061,12 +1082,12 @@ log = logging.getLogger("medallion_bot.app")
 app = Flask(__name__)
 HTML_TEMPLATE = TEMPLATE_HTML
 
-_state_lock = threading.Lock()        # brief holds only -- never during network I/O
-_cycle_running_lock = threading.Lock()  # only one cycle at a time (loop/watchdog/manual)
-_last_watchdog_kick = 0.0
-
+_state_lock = threading.Lock()  # brief holds only -- never during network I/O
 _state = load_state()
 _last_error = None
+_cycle_generation = 0           # bumped by every cycle start; commits must match
+_last_watchdog_kick = 0.0
+LOOP_BOOT_DELAY_SECONDS = 30    # let the container's network settle at boot
 
 
 def _get_state_snapshot():
@@ -1074,31 +1095,51 @@ def _get_state_snapshot():
         return _state
 
 
-def _run_one_cycle():
-    """Runs a single trading cycle. Caller must hold _cycle_running_lock."""
-    global _state, _last_error
-    working_state = run_cycle(_state)
+def _begin_cycle():
+    """Reserve the next cycle generation and take a private working copy of
+    the state. Commit is rejected if a newer generation started meanwhile,
+    so concurrent or hung cycles can never corrupt or block each other."""
+    global _cycle_generation
     with _state_lock:
-        _state = working_state
+        _cycle_generation += 1
+        gen = _cycle_generation
+        snapshot = copy.deepcopy(_state)
+    return gen, snapshot
+
+
+def _commit_cycle(gen, new_state):
+    """Publish a finished cycle's state -- unless a newer cycle superseded it."""
+    global _state
+    with _state_lock:
+        if gen != _cycle_generation:
+            log.info("Discarding stale cycle commit (gen %d superseded by gen %d)",
+                     gen, _cycle_generation)
+            return False
+        _state = new_state
         save_state(_state)
-        _last_error = None
-    log.info("Cycle complete. Open positions: %d, open pairs: %d",
-             len(_state["open_positions"]), len(_state["open_pairs"]))
+        return True
+
+
+def _run_cycle_and_commit(gen, snapshot):
+    """Run one trading cycle and try to commit it. Never holds a lock during
+    network I/O; never raises (errors are recorded instead)."""
+    global _last_error
+    try:
+        result = run_cycle(snapshot)
+        if _commit_cycle(gen, result):
+            _last_error = None
+            log.info("Cycle complete (gen %d). Open positions: %d, open pairs: %d",
+                     gen, len(_state["open_positions"]), len(_state["open_pairs"]))
+    except Exception as e:  # noqa: BLE001
+        _last_error = str(e)
+        log.exception("Cycle failed (gen %d): %s", gen, e)
 
 
 def _cycle_loop():
+    time.sleep(LOOP_BOOT_DELAY_SECONDS)  # container network may not be ready at t=0
     while True:
-        if _cycle_running_lock.acquire(blocking=False):
-            try:
-                _run_one_cycle()
-            except Exception as e:  # noqa: BLE001
-                global _last_error
-                _last_error = str(e)
-                log.exception("Cycle failed: %s", e)
-            finally:
-                _cycle_running_lock.release()
-        else:
-            log.info("Skipping cycle -- another cycle is already running")
+        gen, snapshot = _begin_cycle()
+        _run_cycle_and_commit(gen, snapshot)  # runs in this thread; watchdog runs its own
         time.sleep(CYCLE_SECONDS)
 
 
@@ -1124,30 +1165,22 @@ def _cycle_is_stale():
 
 
 def _watchdog_kick():
-    """Fire-and-forget: if no cycle has completed recently, start one in a
-    fresh thread. Keeps the bot trading even when the background loop is
-    dead (observed on some PaaS runtimes)."""
-    global _last_watchdog_kick, _last_error
+    """Fire-and-forget: if no cycle has completed recently, start a fresh
+    generation cycle in its own thread. A hung older cycle can't block this
+    one -- its commit will simply be discarded."""
+    global _last_watchdog_kick
     now = time.time()
     if not _cycle_is_stale():
         return
-    if now - _last_watchdog_kick < 600:  # at most one watchdog kick per 10 min
+    if now - _last_watchdog_kick < 120:  # throttle failed kicks; success stops kicks ~20 min
         return
-    if not _cycle_running_lock.acquire(blocking=False):
-        return  # a cycle is running right now (loop or manual) -- fine
     _last_watchdog_kick = now
     log.warning("Watchdog: no recent cycle (loop_alive=%s) -- kicking one now", _loop_alive())
-
-    def _run():
-        try:
-            _run_one_cycle()
-        except Exception as e:  # noqa: BLE001
-            _last_error = str(e)
-            log.exception("Watchdog cycle failed: %s", e)
-        finally:
-            _cycle_running_lock.release()
-
-    threading.Thread(target=_run, daemon=True, name="watchdog_cycle").start()
+    gen, snapshot = _begin_cycle()
+    threading.Thread(
+        target=_run_cycle_and_commit, args=(gen, snapshot),
+        daemon=True, name="watchdog_cycle",
+    ).start()
 
 
 @app.before_request
@@ -1219,18 +1252,20 @@ def health():
 
 @app.route("/api/run-now", methods=["POST"])
 def run_now():
-    """Manual trigger for a single cycle -- same rules as the automatic ones."""
-    if not _cycle_running_lock.acquire(blocking=False):
-        return jsonify({"ok": False, "error": "A cycle is already running -- try again in a moment"}), 429
+    """Manual trigger for a single cycle -- same rules as the automatic ones.
+    Works even if a previous cycle is stuck: this one supersedes it and the
+    stuck cycle's result is discarded."""
+    global _last_error
+    gen, snapshot = _begin_cycle()
     try:
-        _run_one_cycle()
+        result = run_cycle(snapshot)
     except Exception as e:  # noqa: BLE001
-        global _last_error
         _last_error = str(e)
         return jsonify({"ok": False, "error": str(e)}), 500
-    finally:
-        _cycle_running_lock.release()
-    return jsonify({"ok": True})
+    committed = _commit_cycle(gen, result)
+    if committed:
+        _last_error = None
+    return jsonify({"ok": True, "committed": committed})
 
 
 if __name__ == "__main__":
@@ -1238,4 +1273,5 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
 else:
+    # gunicorn / production entry
     start_background_loop()

@@ -146,10 +146,13 @@ The free tier sleeps the service after ~15 min without web traffic, and a
 sleeping bot cannot trade. Add the deployed URL's /health path to a free
 pinger (UptimeRobot, cron-job.org, etc.) at a 10-minute interval.
 
-Built-in watchdog: if the background trading loop ever dies (it can, on
-some PaaS runtimes), any web request -- including those keep-alive pings
--- automatically triggers the missed cycle. The dashboard also reports
-`loop_alive` in /api/status.
+Built-in watchdog + hang-proof cycles: if the background trading loop
+ever dies OR hangs (both observed on some PaaS runtimes), any web request
+-- including those keep-alive pings -- automatically triggers a fresh
+cycle. Cycles run in generations, so a stuck one is abandoned and
+superseded instead of blocking anything. Data fetches are hard-bounded
+(including DNS, which the HTTP timeout does not cover). The dashboard
+reports `loop_alive` in /api/status.
 
 Render settings:
 - Build command: `pip install -r requirements.txt`
